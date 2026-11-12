@@ -133,66 +133,81 @@ class WordBot:
             return True
         return False
 
-    def click_too_easy(self, items: list[OCRItem], image: Image.Image) -> bool:
-        """点右上角「标记为太简单（无需复习）」，成功推进返回 True。
-
-        那个小标签是浅灰字，OCR 经常认不到，所以：
-        先按 OCR 文字点，认不到就按固定相对坐标（config 的 fallback_points.too_easy）点。
-        两种都点完要校验画面：没变化就返回 False，交给「认识」。
-        """
-        item = self.vision.find(
-            items, "标记为太简单", "标记为大简单", "太简单", "无需复习", "复习",
-        )
-        w = float(image.width) or 1.0
-        h = float(image.height) or 1.0
-        candidates: list[tuple[float, float]] = []
-        if item is not None:
-            candidates.append((item.cx / w, item.cy / h))
-            # 图标在文字左边，有些实现只有图标可点
-            candidates.append((max(0.02, (item.cx - 30) / w), item.cy / h))
-            candidates.append((min(0.99, (item.cx + 25) / w), item.cy / h))
-            LOG.info("识别到「无需复习」标签 at (%.0f, %.0f)，依次尝试附近点位", item.cx, item.cy)
+    def _chip_band(self, nx: float, ny: float):
+        """截「标记为太简单」标签附近的一小块，用来判断点击有没有生效。"""
         try:
-            fixed = self.point("too_easy")
+            import numpy as np
+
+            img = self.screen.capture()
+            w, h = img.size
+            x0 = int(max(0, (nx - 0.13) * w))
+            x1 = int(min(w, (nx + 0.11) * w))
+            y0 = int(max(0, (ny - 0.035) * h))
+            y1 = int(min(h, (ny + 0.035) * h))
+            if x1 - x0 < 6 or y1 - y0 < 6:
+                return None
+            return np.asarray(img.convert("L"))[y0:y1, x0:x1].astype("int16")
         except Exception:  # noqa: BLE001
-            fixed = None
-        if fixed is not None:
-            candidates.append(fixed)
-        seen: set[tuple[float, float]] = set()
-        points = []
-        for nx, ny in candidates:
-            key = (round(nx, 3), round(ny, 3))
-            if key in seen:
+            return None
+
+    def click_too_easy(self, items: list[OCRItem], image: Image.Image) -> bool:
+        """点右上角「标记为太简单（无需复习）」。
+
+        实测（2026-11-12）：这个标签**可以点**，点完标签会消失，但页面不会跳，
+        所以必须再点一次「认识」才进入下一词。
+
+        判定方式改成只看标签那一小块：标签消失 = 标记成功。
+        """
+        item = None
+        for it in items:
+            t = norm_text(it.text)
+            if not any(k in t for k in ("标记为", "太简单", "无需复习")):
                 continue
-            seen.add(key)
-            points.append((nx, ny))
+            if it.cy > image.height * 0.35:      # 只看页面上方，避开「今日复习」等字样
+                continue
+            item = it
+            break
 
-        before = self._signature(self.screen.capture())
-        rw = float(self.screen.region.width) or 1.0
-        rh = float(self.screen.region.height) or 1.0
-
-        for nx, ny in points:
-            LOG.info("尝试点「无需复习」 (%.3f, %.3f)", nx, ny)
-            self.screen.click_rel(nx, ny)
-            time.sleep(0.45)
-            if self._signature(self.screen.capture()) != before:
-                LOG.info("已标记为太简单（无需复习）")
-                return True
-
-        LOG.info("后台点击都没生效，改用真实鼠标再试")
-        self.ensure_foreground_safe()
-        for nx, ny in points:
+        if item is not None:
+            nx = item.cx / image.width
+            ny = item.cy / image.height
+            LOG.info("找到「无需复习」标签 at (%.0f, %.0f)", item.cx, item.cy)
+        else:
             try:
-                self.screen.foreground_click_rel(nx, ny, delay=0.35, clicks=2)
-            except TypeError:
-                self.screen.foreground_click_rel(nx, ny, delay=0.35)
-            time.sleep(0.5)
-            if self._signature(self.screen.capture()) != before:
-                LOG.info("已标记为太简单（无需复习）")
-                return True
+                nx, ny = self.point("too_easy")
+            except Exception:  # noqa: BLE001
+                return False
+            LOG.info("OCR 没认出标签，用校准坐标 (%.3f, %.3f)", nx, ny)
 
-        LOG.info("「无需复习」所有点位都没反应，改点「认识」")
-        return False
+        before = self._chip_band(nx, ny)
+        self.ensure_foreground_safe()
+        LOG.info("点「标记为太简单（无需复习）」 (%.3f, %.3f)", nx, ny)
+        try:
+            self.screen.foreground_click_rel(nx, ny, delay=0.5, clicks=1)   # 单击，别双击（双击会取消）
+        except TypeError:
+            self.screen.foreground_click_rel(nx, ny, delay=0.5)
+        time.sleep(0.6)
+
+        after = self._chip_band(nx, ny)
+        marked = True
+        if before is not None and after is not None and before.shape == after.shape:
+            import numpy as np
+
+            diff = float(np.abs(after - before).mean())
+            marked = diff >= 1.0
+            LOG.info("标签区域变化 %.2f → %s", diff, "已标记" if marked else "没反应")
+
+        if not marked:
+            LOG.info("「无需复习」点了没反应，改点「认识」")
+            return False
+
+        LOG.info("已标记为太简单（无需复习）；页面通常不跳，接着点「认识」进入下一词")
+        time.sleep(0.4)
+        shot = self.screen.capture()
+        items2 = self.vision.read(shot)
+        if self.click_label_exact(items2, "认识", "模糊", fallback="know"):
+            return True
+        return True
 
     def click_label_exact(self, items: list[OCRItem], *labels: str, fallback: str | None = None) -> bool:
         """按「完全相同」的文字点按钮，避免「认识」误命中「不认识」。"""
