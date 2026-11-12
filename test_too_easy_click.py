@@ -88,7 +88,8 @@ def make_bot(too_easy_works: bool):
         "audio_capture": False,
         "ocr_max_side": 512,
         "ocr_threads": 3,
-        "fallback_points": {"know": [0.5, 0.83], "next_word": [0.5, 0.955]},
+        "fallback_points": {"know": [0.5, 0.83], "next_word": [0.5, 0.955],
+                            "too_easy": [0.83, 0.175]},
     }
     tmp = Path("_test_tmp")
     tmp.mkdir(exist_ok=True)
@@ -108,9 +109,13 @@ def main() -> int:
     items = page_items()
     handled = bot.click_too_easy(items, bot.screen.image)
     calls = bot.screen.calls
-    checks.append(("点的是右上角「标记为太简单」", any(c[0] == "abs" and c[2] < 300 for c in calls), calls))
+    checks.append(("点的是右上角「标记为太简单」",
+                   any((c[0] == "rel" and c[2] < 0.30) or (c[0] == "abs" and c[2] < 300)
+                       for c in calls), calls))
     checks.append(("点成功返回 True", handled is True, handled))
-    checks.append(("没有点「认识」", not any(c[0] == "abs" and c[2] > 800 for c in calls), calls))
+    checks.append(("没有点「认识」",
+                   not any((c[0] == "rel" and c[2] > 0.7) or (c[0] == "abs" and c[2] > 800)
+                           for c in calls), calls))
 
     # 情况 B：点「无需复习」没反应 → 返回 False，交给「认识」
     bot2 = make_bot(False)
@@ -119,10 +124,11 @@ def main() -> int:
     checks.append(("点不动时尝试过真实鼠标", any(c[0] == "fg" for c in bot2.screen.calls),
                    bot2.screen.calls))
 
-    # 情况 C：页面没有该标签 → 直接 False，不瞎点
+    # 情况 C：页面没有该标签 → 仍会试固定点位，但点不动时必须返回 False
     bot3 = make_bot(False)
     no_label = [i for i in page_items() if "标记" not in i.text]
-    checks.append(("没有标签时不动作", bot3.click_too_easy(no_label, bot3.screen.image) is False,
+    result3 = bot3.click_too_easy(no_label, bot3.screen.image)
+    checks.append(("没有标签时按固定点位试，点不动返回 False", result3 is False,
                    bot3.screen.calls))
 
     ok = 0

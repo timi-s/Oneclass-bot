@@ -136,35 +136,63 @@ class WordBot:
     def click_too_easy(self, items: list[OCRItem], image: Image.Image) -> bool:
         """点右上角「标记为太简单（无需复习）」，成功推进返回 True。
 
-        这个位置有时只是状态标签（点了没反应），所以点击后要校验画面；
-        没反应就用真实鼠标再点两下，仍不动就返回 False 交给「认识」。
+        那个小标签是浅灰字，OCR 经常认不到，所以：
+        先按 OCR 文字点，认不到就按固定相对坐标（config 的 fallback_points.too_easy）点。
+        两种都点完要校验画面：没变化就返回 False，交给「认识」。
         """
-        item = self.vision.find(items, "标记为太简单", "无需复习")
-        if item is None:
-            return False
-        before = self._signature(self.screen.capture())
-        LOG.info("点「标记为太简单（无需复习）」 at (%.0f, %.0f)", item.cx, item.cy)
-        self.screen.click_abs(item.cx, item.cy)
-        time.sleep(0.5)
-        if self._signature(self.screen.capture()) != before:
-            LOG.info("已标记为太简单（无需复习）")
-            return True
-
-        LOG.info("后台点击没生效，改用真实鼠标点「无需复习」")
-        self.ensure_foreground_safe()
-        w = float(self.screen.region.width) or 1.0
-        h = float(self.screen.region.height) or 1.0
+        item = self.vision.find(
+            items, "标记为太简单", "标记为大简单", "太简单", "无需复习", "复习",
+        )
+        w = float(image.width) or 1.0
+        h = float(image.height) or 1.0
+        candidates: list[tuple[float, float]] = []
+        if item is not None:
+            candidates.append((item.cx / w, item.cy / h))
+            # 图标在文字左边，有些实现只有图标可点
+            candidates.append((max(0.02, (item.cx - 30) / w), item.cy / h))
+            candidates.append((min(0.99, (item.cx + 25) / w), item.cy / h))
+            LOG.info("识别到「无需复习」标签 at (%.0f, %.0f)，依次尝试附近点位", item.cx, item.cy)
         try:
-            self.screen.foreground_click_rel(item.cx / w, item.cy / h, delay=0.4, clicks=2)
-        except TypeError:
-            self.screen.foreground_click_rel(item.cx / w, item.cy / h, delay=0.4)
-        time.sleep(0.6)
-        moved = self._signature(self.screen.capture()) != before
-        if moved:
-            LOG.info("已标记为太简单（无需复习）")
-        else:
-            LOG.info("「无需复习」点了没反应，改点「认识」")
-        return moved
+            fixed = self.point("too_easy")
+        except Exception:  # noqa: BLE001
+            fixed = None
+        if fixed is not None:
+            candidates.append(fixed)
+        seen: set[tuple[float, float]] = set()
+        points = []
+        for nx, ny in candidates:
+            key = (round(nx, 3), round(ny, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            points.append((nx, ny))
+
+        before = self._signature(self.screen.capture())
+        rw = float(self.screen.region.width) or 1.0
+        rh = float(self.screen.region.height) or 1.0
+
+        for nx, ny in points:
+            LOG.info("尝试点「无需复习」 (%.3f, %.3f)", nx, ny)
+            self.screen.click_rel(nx, ny)
+            time.sleep(0.45)
+            if self._signature(self.screen.capture()) != before:
+                LOG.info("已标记为太简单（无需复习）")
+                return True
+
+        LOG.info("后台点击都没生效，改用真实鼠标再试")
+        self.ensure_foreground_safe()
+        for nx, ny in points:
+            try:
+                self.screen.foreground_click_rel(nx, ny, delay=0.35, clicks=2)
+            except TypeError:
+                self.screen.foreground_click_rel(nx, ny, delay=0.35)
+            time.sleep(0.5)
+            if self._signature(self.screen.capture()) != before:
+                LOG.info("已标记为太简单（无需复习）")
+                return True
+
+        LOG.info("「无需复习」所有点位都没反应，改点「认识」")
+        return False
 
     def click_label_exact(self, items: list[OCRItem], *labels: str, fallback: str | None = None) -> bool:
         """按「完全相同」的文字点按钮，避免「认识」误命中「不认识」。"""
