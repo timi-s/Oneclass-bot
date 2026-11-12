@@ -408,6 +408,13 @@ class BotRunner:
                 self.stop()
                 note = ("机器人已经 %.0f 秒没有任何日志，判定为卡死，已自动停止。"
                         "请查看小程序是否卡住/被遮挡，然后重新启动。" % quiet)
+                # 把这次强制停止写进机器人日志，事后能对上时间
+                try:
+                    with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                        fh.write("%s | ERROR | [界面看门狗] 机器人 %.0f 秒没有日志，已强制停止\n"
+                                 % (time.strftime("%Y-%m-%d %H:%M:%S"), quiet))
+                except Exception:
+                    pass
         return lines, note
 
 

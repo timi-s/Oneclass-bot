@@ -117,7 +117,7 @@ class WordBot:
                 if self._signature(self.screen.capture()) == before:
                     # 后台点击对按钮常常无效 → 换成真实鼠标点两下（先激活窗口）
                     LOG.info("后台点击「%s」没生效，改用真实鼠标再点一次", item.text)
-                    self.ensure_foreground()
+                    self.ensure_foreground_safe()
                     w = float(self.screen.region.width) or 1.0
                     h = float(self.screen.region.height) or 1.0
                     try:
@@ -133,6 +133,39 @@ class WordBot:
             return True
         return False
 
+    def click_too_easy(self, items: list[OCRItem], image: Image.Image) -> bool:
+        """点右上角「标记为太简单（无需复习）」，成功推进返回 True。
+
+        这个位置有时只是状态标签（点了没反应），所以点击后要校验画面；
+        没反应就用真实鼠标再点两下，仍不动就返回 False 交给「认识」。
+        """
+        item = self.vision.find(items, "标记为太简单", "无需复习")
+        if item is None:
+            return False
+        before = self._signature(self.screen.capture())
+        LOG.info("点「标记为太简单（无需复习）」 at (%.0f, %.0f)", item.cx, item.cy)
+        self.screen.click_abs(item.cx, item.cy)
+        time.sleep(0.5)
+        if self._signature(self.screen.capture()) != before:
+            LOG.info("已标记为太简单（无需复习）")
+            return True
+
+        LOG.info("后台点击没生效，改用真实鼠标点「无需复习」")
+        self.ensure_foreground_safe()
+        w = float(self.screen.region.width) or 1.0
+        h = float(self.screen.region.height) or 1.0
+        try:
+            self.screen.foreground_click_rel(item.cx / w, item.cy / h, delay=0.4, clicks=2)
+        except TypeError:
+            self.screen.foreground_click_rel(item.cx / w, item.cy / h, delay=0.4)
+        time.sleep(0.6)
+        moved = self._signature(self.screen.capture()) != before
+        if moved:
+            LOG.info("已标记为太简单（无需复习）")
+        else:
+            LOG.info("「无需复习」点了没反应，改点「认识」")
+        return moved
+
     def click_label_exact(self, items: list[OCRItem], *labels: str, fallback: str | None = None) -> bool:
         """按「完全相同」的文字点按钮，避免「认识」误命中「不认识」。"""
         wanted = [norm_text(l) for l in labels]
@@ -146,7 +179,7 @@ class WordBot:
                         time.sleep(0.45)
                         if self._signature(self.screen.capture()) == before:
                             LOG.info("后台点击「%s」没生效，改用真实鼠标再点一次", it.text)
-                            self.ensure_foreground()
+                            self.ensure_foreground_safe()
                             w = float(self.screen.region.width) or 1.0
                             h = float(self.screen.region.height) or 1.0
                             try:
@@ -966,7 +999,7 @@ class WordBot:
                     "这页已连续 %d 轮没推进（learn_hidden），强制用真实鼠标重点",
                     self._state_repeat,
                 )
-                self.ensure_foreground()
+                self.ensure_foreground_safe()
                 for cx, cy in candidates:
                     self.screen.foreground_click_rel(cx, cy, delay=0.3, clicks=2)
                     time.sleep(0.5)
@@ -979,7 +1012,7 @@ class WordBot:
 
             # 后台点击没生效：先把窗口置前，再用真实鼠标依次试几个位置。
             LOG.warning("点空白后页面没反应，先把窗口置前再重试点击")
-            self.ensure_foreground()
+            self.ensure_foreground_safe()
             for cx, cy in candidates:
                 self.screen.foreground_click_rel(cx, cy, delay=0.3, clicks=2)
                 time.sleep(0.5)
@@ -1003,6 +1036,10 @@ class WordBot:
         elif state == "learn_revealed":
             self.learn_from_page(items, image)
             self.collect_audio_template(items, image)
+            # 优先点右上角「标记为太简单（无需复习）」：点了这词就不再安排复习。
+            # 点不动（那只是个标签）再退回点「认识」。
+            if bool(self.cfg.get("mark_too_easy", True)) and self.click_too_easy(items, image):
+                return
             self.click_label_exact(items, "认识", "模糊", fallback="know")
         elif state == "learn_detail":
             self.learn_from_page(items, image)
@@ -1088,7 +1125,7 @@ class WordBot:
                 "认不出页面（第 %d 次），把小程序窗口置前再说（可能被浏览器/命令行挡住了）",
                 self.unknown_count,
             )
-            self.ensure_foreground()
+            self.ensure_foreground_safe()
         if self.unknown_count % 8 == 0:
             LOG.warning("连续未识别页面，OCR=%s", self.vision.joined(items))
             if self.debug:
@@ -1203,10 +1240,12 @@ class WordBot:
                         u.GetWindowRect(hwnd, ctypes.byref(rc))
                         cx = (rc.left + rc.right) // 2
                         cy = rc.top + 10
-                        pos = pyautogui.position()
-                        pyautogui.click(cx, cy)
-                        time.sleep(0.35)
-                        pyautogui.moveTo(pos.x, pos.y, duration=0.1)
+                        # 最小化的窗口坐标是 -32000 之类，点它没有意义还可能把鼠标甩到屏幕外
+                        if rc.left > -10000 and rc.top > -10000 and cx > 0 and cy > 0:
+                            pos = pyautogui.position()
+                            pyautogui.click(cx, cy)
+                            time.sleep(0.35)
+                            pyautogui.moveTo(pos.x, pos.y, duration=0.1)
                         ok = int(u.GetForegroundWindow()) == hwnd
                     except Exception:  # noqa: BLE001
                         pass
@@ -1338,6 +1377,24 @@ class WordBot:
         self._last_fg_at = now
         return True
 
+    def ensure_foreground_safe(self, reason: str = "", quiet: bool = True) -> bool:
+        """带 3 秒超时版的置前：万一系统接口卡住，不让主循环跟着卡。"""
+        box: dict[str, bool] = {}
+
+        def work() -> None:
+            try:
+                box["ok"] = self.ensure_foreground(reason, quiet=quiet)
+            except Exception:  # noqa: BLE001
+                box["ok"] = False
+
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(timeout=3.0)
+        if th.is_alive():
+            LOG.warning("置前窗口超过 3 秒没返回，跳过这次（不影响继续）")
+            return False
+        return bool(box.get("ok"))
+
     def ensure_target_foreground(self) -> None:
         """当前前台不是小程序就把它提到最前（每轮截图前调用，保证截到的是小程序）。"""
         now = time.monotonic()
@@ -1354,7 +1411,7 @@ class WordBot:
             return
         if any(fg == hwnd for hwnd, _t, _m in wins):
             return
-        if not self.ensure_foreground("截图前置前：", quiet=True):
+        if not self.ensure_foreground_safe("截图前置前：", quiet=True):
             # 抢不到前台（可能窗口最小化/屏幕锁定）→ 退避 5 秒，别每轮都刷屏
             self._fg_backoff_until = now + 5.0
 
@@ -1390,7 +1447,7 @@ class WordBot:
             self._log_heartbeat(state)
             # 定时把小程序窗口置前，避免被别的窗口盖住导致截图截错
             if self._should_keep_foreground():
-                self.ensure_foreground("定期置前：")
+                self.ensure_foreground_safe("定期置前：")
             if state != "unknown":
                 self.unknown_count = 0
             if self.should_pause_clicking():
