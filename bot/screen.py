@@ -117,6 +117,7 @@ class Screen:
         win32_fallback_to_pyautogui: bool = True,
     ):
         self.region = Region(*map(int, region))
+        self.region = self._fit_to_screen(self.region)
         self.after_click_delay = float(after_click_delay)
         self.input_backend = str(input_backend).lower().strip()
         self.win32_fallback_to_pyautogui = bool(win32_fallback_to_pyautogui)
@@ -138,6 +139,35 @@ class Screen:
             LOG.info("输入模式：PyAutoGUI（会移动并占用鼠标）")
         else:
             raise ValueError("input_backend 只能是 win32 或 pyautogui")
+
+    @staticmethod
+    def screen_size() -> tuple[int, int]:
+        """主屏幕分辨率（物理像素，已按 DPI 感知）。"""
+        try:
+            user32 = ctypes.windll.user32
+            return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        except Exception:  # noqa: BLE001
+            return 0, 0
+
+    @classmethod
+    def _fit_to_screen(cls, region: "Region") -> "Region":
+        """把识别区域收进屏幕内；收不了就按屏幕重算尺寸。"""
+        sw, sh = cls.screen_size()
+        if sw <= 0 or sh <= 0:
+            return region
+        left = max(0, min(region.left, sw - 60))
+        top = max(0, min(region.top, sh - 60))
+        width = min(region.width, sw - left)
+        height = min(region.height, sh - top)
+        if (left, top, width, height) != (region.left, region.top,
+                                          region.width, region.height):
+            LOG.warning(
+                "识别区域超出屏幕（屏幕 %dx%d）：已自动收进屏幕内 "
+                "(%d,%d) %dx%d → (%d,%d) %dx%d，建议重新「扫描窗口 → 预览确认定位」",
+                sw, sh, region.left, region.top, region.width, region.height,
+                left, top, width, height,
+            )
+        return Region(left, top, width, height)
 
     def capture(self) -> Image.Image:
         monitor = {

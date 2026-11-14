@@ -38,6 +38,7 @@ def main() -> int:
     tmp.mkdir(exist_ok=True)
     log = tmp / "wd.log"
     log.write_text("", encoding="utf-8")
+    gui.LOG_FILE = log
     tail = gui.LogTail(log)
     runner = gui.BotRunner(tail)
     runner.proc = FakeProc()
@@ -60,6 +61,7 @@ def main() -> int:
         gui.SILENCE_LIMIT = old
 
     # 3) 有日志就不该判卡死
+    gui.LOG_FILE = log
     runner2 = gui.BotRunner(gui.LogTail(log))
     runner2.proc = FakeProc()
     runner2.last_log_at = time.monotonic() - 5

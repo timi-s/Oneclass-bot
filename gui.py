@@ -301,6 +301,22 @@ def preflight() -> list[str]:
             problems.append("region 太小（%dx%d），请重新定位窗口" % (w, h))
         if w > h:
             problems.append("region 是横向的（%dx%d），小程序窗口一般是竖向" % (w, h))
+        try:
+            import ctypes
+
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                pass
+            sw = ctypes.windll.user32.GetSystemMetrics(0)
+            sh = ctypes.windll.user32.GetSystemMetrics(1)
+            if sw and sh and (x + w > sw or y + h > sh or x < 0 or y < 0):
+                problems.append(
+                    "识别区域超出屏幕（屏幕 %dx%d，区域 %d,%d %dx%d）："
+                    "请点「扫描窗口 → 预览并确认定位」重新定位"
+                    % (sw, sh, x, y, w, h))
+        except Exception:
+            pass
         page, ocr = probe_region(region)
         if page is None:
             problems.append("这块区域截图后认不出小程序内容（多半被别的窗口挡住了）：%s"
@@ -314,6 +330,22 @@ def preflight() -> list[str]:
 
     if sys.version_info[:2] != (3, 13):
         problems.append("当前 Python 是 %d.%d，依赖是按 3.13 装的" % sys.version_info[:2])
+
+    # 回环录音自检（子进程，崩了也不影响界面）
+    try:
+        env_a = dict(os.environ, PYTHONPATH=str(SITE), PYTHONIOENCODING="utf-8")
+        ra = subprocess.run([sys.executable, "-m", "bot.audio_probe"],
+                            cwd=str(ROOT), env=env_a, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=25)
+        out_a = (ra.stdout or "").strip().splitlines()
+        line_a = out_a[-1] if out_a else ""
+        if ra.returncode != 0:
+            problems.append(
+                "回环录音不可用（%s）：听写题会失败。可先把 config.yaml 的 "
+                "audio_capture 改成 false（只背单词），或换 audio_loopback_name"
+                % (line_a[:60] or "soundcard 报错"))
+    except Exception:
+        pass
 
     env = dict(os.environ, PYTHONPATH=str(SITE))
     try:
@@ -356,11 +388,24 @@ class LogTail:
 class BotRunner:
     """机器人子进程 + 看门狗（45 秒无日志自动杀掉）。"""
 
-    def __init__(self, tail: LogTail):
+    def __init__(self, tail: LogTail, cmd: list[str] | None = None):
         self.tail = tail
+        self.cmd = cmd                      # 测试时可注入命令
         self.proc: subprocess.Popen | None = None
         self.last_log_at = time.monotonic()
         self.killed_by_watchdog = False
+        self.exit_reported = False
+        self.console_log = ROOT / "logs" / "bot_console.log"
+
+    def console_tail(self, n: int = 8) -> list[str]:
+        """机器人控制台输出（python 的错误都在这里）。"""
+        try:
+            if not self.console_log.exists():
+                return []
+            text = self.console_log.read_text(encoding="utf-8", errors="replace")
+            return [ln for ln in text.splitlines() if ln.strip()][-n:]
+        except Exception:
+            return []
 
     @property
     def running(self) -> bool:
@@ -370,13 +415,20 @@ class BotRunner:
         if self.running:
             return True
         env = dict(os.environ, PYTHONPATH=str(SITE), PYTHONIOENCODING="utf-8")
-        cmd = [sys.executable, "-u", str(ROOT / "main.py")]
+        cmd = self.cmd or [sys.executable, "-u", str(ROOT / "main.py")]
         try:
+            self.console_log.parent.mkdir(parents=True, exist_ok=True)
+            self._console = open(self.console_log, "w", encoding="utf-8", errors="replace")
             self.proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env,
-                                         stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL,
+                                         stdout=self._console,
+                                         stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self._console.write("启动失败：%s\n" % exc)
+                self._console.close()
+            except Exception:
+                pass
             return False
         self.tail.reset()
         self.last_log_at = time.monotonic()
@@ -401,6 +453,20 @@ class BotRunner:
         if lines:
             self.last_log_at = time.monotonic()
         note = None
+        if (not self.running) and self.proc is not None and not self.exit_reported \
+                and not self.killed_by_watchdog:
+            self.exit_reported = True
+            code = self.proc.returncode
+            tail_lines = self.console_tail(10)
+            detail = "\n".join(tail_lines) if tail_lines else "（没有输出）"
+            note = ("机器人启动后自己退出了（退出码 %s）。\n\n最后输出：\n%s\n\n"
+                    "常见原因：依赖没装好 / Python 版本不对 / 配置写坏。\n"
+                    "完整记录见 logs\\bot_console.log" % (code, detail[-800:]))
+            try:
+                if hasattr(self, "_console") and self._console:
+                    self._console.close()
+            except Exception:
+                pass
         if self.running:
             quiet = time.monotonic() - self.last_log_at
             if quiet > SILENCE_LIMIT:
@@ -776,6 +842,19 @@ def build_app():
 
     def do_start():
         if runner.running:
+            return
+        problems = preflight()
+        fatal = [p for p in problems
+                 if p.startswith("当前 Python") or p.startswith("依赖不全")]
+        if fatal:
+            log("[预检] 致命问题，无法启动：", "err")
+            for item in fatal:
+                log("    " + item, "err")
+            messagebox.showerror(
+                "无法启动",
+                "环境不满足，直接启动会秒退：\n\n· %s\n\n"
+                "请先双击 安装.cmd，或安装 Python 3.13。" % "\n· ".join(fatal),
+            )
             return
         if not do_preflight(show=False):
             if not messagebox.askyesno("预检未通过", "有上面的问题，仍然要启动吗？"):

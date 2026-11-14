@@ -55,14 +55,51 @@ class WordBot:
             or str(cfg.get("dictation_mode", "")).lower() == "whisper"
         )
         if self.use_audio:
+            # 先在独立子进程里试录：某些电脑的声卡驱动会让 soundcard 抛
+            # struct.error，甚至在主进程里造成堆损坏（0xC0000374）直接崩溃。
             try:
-                self.audio.start_capture()
-                atexit.register(self.audio.stop_capture)
+                from .audio_probe import probe_subprocess
+
+                ok, msg = probe_subprocess()
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("常驻录音启动失败：%s", exc)
+                ok, msg = False, str(exc)
+            if not ok:
+                LOG.warning("本机回环录音不可用，已自动关闭录音：%s", msg)
+                LOG.warning("影响：听写题只能跳过（背单词、选择题照常）。"
+                            "想修好：在 config.yaml 里把 audio_loopback_name 设成能用的设备，"
+                            "或装虚拟声卡（VB-Cable）后重试。")
+                self.use_audio = False
+            else:
+                LOG.info("录音自检通过：%s", msg)
+                try:
+                    self.audio.start_capture()
+                    atexit.register(self.audio.stop_capture)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("常驻录音启动失败，已关闭录音：%s", exc)
+                    self.use_audio = False
         # 音频指纹：把背单词阶段的读音存起来，测试时比对
         self.audio_enabled = bool(cfg.get("audio_templates", False))
         self.audio_index = AudioIndex(root / "audio_templates.json") if self.audio_enabled else None
+        if self.audio_index is not None and len(self.audio_index):
+            try:
+                from .machine import machine_id
+
+                ok = self.audio_index.machine_ok(machine_id())
+            except Exception:  # noqa: BLE001
+                ok = None
+            strict = bool(cfg.get("audio_templates_strict", True))
+            if ok is False or (ok is None and strict):
+                LOG.warning(
+                    "发音模板不是这台机器录的（%d 条）：已自动停用模板匹配，听写改用 Whisper 识别。"
+                    " 想要模板加速，就在本机重新积累（删掉 audio_templates.json 即可）。",
+                    len(self.audio_index),
+                )
+                self.audio_enabled = False
+                self.audio_index = None
+            else:
+                LOG.info("发音模板可用：%d 条（来源：%s）",
+                         len(self.audio_index),
+                         (self.audio_index.meta or {}).get("machine") or "未知")
         self._last_template_word = ""
         self._template_silent = 0
         # 同一道听写题只录一次：记住当前页和识别出的词
@@ -201,12 +238,9 @@ class WordBot:
             LOG.info("「无需复习」点了没反应，改点「认识」")
             return False
 
-        LOG.info("已标记为太简单（无需复习）；页面通常不跳，接着点「认识」进入下一词")
-        time.sleep(0.4)
-        shot = self.screen.capture()
-        items2 = self.vision.read(shot)
-        if self.click_label_exact(items2, "认识", "模糊", fallback="know"):
-            return True
+        # 标记成功后不再盲目补点「认识」：页面可能已经跳到下一词或详情页，
+        # 交给主循环按新的页面状态处理，避免用兜底坐标点空、来回打转。
+        LOG.info("已标记为太简单（无需复习），下一轮按新页面继续")
         return True
 
     def click_label_exact(self, items: list[OCRItem], *labels: str, fallback: str | None = None) -> bool:

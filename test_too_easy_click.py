@@ -124,11 +124,12 @@ def main() -> int:
                    clicks_fg[:1]))
     checks.append(("只单击（clicks=1，避免取消标记）",
                    bool(clicks_fg) and clicks_fg[0][3] == 1, clicks_fg[:1]))
+    # 标记成功后不再盲目补点「认识」，交给主循环按新页面处理
     know_after = [c for c in calls
                   if (c[0] == "fg" and abs(c[2] - 0.83) < 0.06)
                   or (c[0] == "rel" and abs(c[2] - 0.83) < 0.06)
                   or (c[0] == "abs" and abs(c[2] - H * 0.83) < 60)]
-    checks.append(("标记后补点了「认识」", bool(know_after), calls))
+    checks.append(("标记后不再补点「认识」", not know_after, calls))
 
     # 2) 标签点不动 → 返回 False，交给调用方点认识
     bot2 = make_bot(False)

@@ -120,13 +120,26 @@ class AudioIndex:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.templates: dict[str, np.ndarray] = {}
+        self.meta: dict = {}
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "templates" in data:
+                    self.meta = dict(data.get("_meta") or {})
+                    data = data.get("templates") or {}
                 for word, rows in data.items():
+                    if str(word).startswith("_"):
+                        continue
                     self.templates[word] = np.asarray(rows, dtype=np.float32)
             except Exception:
                 self.templates = {}
+
+    def machine_ok(self, machine_id: str) -> bool:
+        """模板是不是本机录的。老模板没有记录来源时返回 None 表示未知。"""
+        got = str(self.meta.get("machine") or "")
+        if not got:
+            return True if not self.templates else None  # type: ignore[return-value]
+        return got.upper() == str(machine_id or "").upper()
 
     def __len__(self) -> int:
         return len(self.templates)
@@ -143,8 +156,17 @@ class AudioIndex:
 
     def save(self) -> None:
         data = {w: f.astype(np.float32).round(4).tolist() for w, f in self.templates.items()}
+        if not self.meta.get("machine"):
+            try:
+                from bot.machine import machine_id as _mid
+
+                self.meta["machine"] = _mid()
+            except Exception:
+                pass
+        self.meta.setdefault("saved", __import__("time").strftime("%Y-%m-%d %H:%M:%S"))
+        payload = {"_meta": self.meta, "templates": data}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     def match(
         self,
